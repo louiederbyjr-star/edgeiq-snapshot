@@ -1,0 +1,12 @@
+# railway.toml for snapshot_odds.py
+# Deploy this as a SEPARATE Railway service from your score_picks.py
+# This one runs every hour, the scorer runs once at 8 AM
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python snapshot_odds.py"
+cronSchedule = "0 * * * *"   # top of every hour, 24/7
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
