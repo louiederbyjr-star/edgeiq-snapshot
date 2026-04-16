@@ -4,7 +4,10 @@ Runs every hour via Railway cron job.
 Saves current odds for all games to Supabase so we can
 track real line movement over time.
 
-Uses only: requests, python-dotenv
+Key improvement: also saves a "seed" snapshot for any new game
+that doesn't have a snapshot yet today — using the current line
+as the opening baseline. This ensures ALL games have opening
+line data even if they were posted after the first snapshot.
 """
 
 import os
@@ -23,6 +26,7 @@ SPORTS = [
     "americanfootball_nfl",
     "baseball_mlb",
     "icehockey_nhl",
+    "soccer_usa_mls",
 ]
 
 # ── Supabase helpers ──────────────────────────────────────────────────
@@ -44,6 +48,21 @@ def sb_insert(table, record):
     if r.status_code not in (200, 201):
         print(f"  Warning: insert {r.status_code}: {r.text}")
 
+def sb_get_existing_game_ids(today):
+    """Get set of game_ids already snapshotted today."""
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/odds_snapshots",
+        headers={**sb_headers(), "Prefer": "return=representation"},
+        params={
+            "snap_date": f"eq.{today}",
+            "select":    "game_id",
+        },
+        timeout=10,
+    )
+    if r.status_code == 200:
+        return set(row["game_id"] for row in r.json())
+    return set()
+
 # ── helpers ───────────────────────────────────────────────────────────
 
 def safe_avg(values):
@@ -52,13 +71,18 @@ def safe_avg(values):
 # ── main ──────────────────────────────────────────────────────────────
 
 def take_snapshot():
-    now       = datetime.now(timezone.utc)
+    now           = datetime.now(timezone.utc)
     snapshot_time = now.isoformat()
-    today     = now.date().isoformat()
-    total     = 0
+    today         = now.date().isoformat()
+    total         = 0
+    seeded        = 0
+
+    # get game IDs already snapshotted today
+    existing_ids = sb_get_existing_game_ids(today)
+    print(f"Games already snapshotted today: {len(existing_ids)}")
 
     for sport in SPORTS:
-        print(f"Snapshotting {sport}...")
+        print(f"\nSnapshotting {sport}...")
         try:
             resp = requests.get(
                 f"https://api.the-odds-api.com/v4/sports/{sport}/odds/",
@@ -92,6 +116,8 @@ def take_snapshot():
             if not bookmakers:
                 continue
 
+            is_new_game = game["id"] not in existing_ids
+
             # collect odds per team across all books
             juices  = {}
             spreads = {}
@@ -114,7 +140,6 @@ def take_snapshot():
                 avg_juice  = safe_avg(juice_list)
                 avg_spread = safe_avg(spreads.get(team, [0]))
 
-                # skip invalid odds values
                 if avg_juice == 0 or -99 < avg_juice < 99:
                     continue
 
@@ -131,10 +156,23 @@ def take_snapshot():
                     "num_books":     len(bookmakers),
                     "game_time":     game["commence_time"],
                 }
+
+                # if this game has no snapshots yet today, save TWO rows:
+                # one marked as the "opening" (seed) and one as current
+                # this ensures CLV and line movement work even for late-posted games
+                if is_new_game:
+                    seed_record = {**record, "snapshot_time": today + "T00:00:00+00:00"}
+                    sb_insert("odds_snapshots", seed_record)
+                    seeded += 1
+
                 sb_insert("odds_snapshots", record)
                 total += 1
 
-    print(f"\n✅ Snapshot complete — {total} rows saved at {snapshot_time}")
+            if is_new_game:
+                existing_ids.add(game["id"])  # mark as seeded
+
+    print(f"\n✅ Snapshot complete — {total} rows saved, {seeded} new game seeds")
+    print(f"   Timestamp: {snapshot_time}")
 
 if __name__ == "__main__":
     take_snapshot()
